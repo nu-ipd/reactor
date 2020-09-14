@@ -1,7 +1,6 @@
 #lang racket/base
 
-(provide (rename-out [make-reactor reactor])
-         reactor? reactor-state
+(provide reactor reactor? reactor-state
          react reactor-stopped? render-reactor run-reactor
          (rename-out [the-time-step time-step])
          key-event mouse-event
@@ -9,24 +8,58 @@
 
 (require (only-in racket/match match)
          2htdp/universe)
-(require (for-syntax racket/base
+(require syntax/parse/define
+         (for-syntax racket/base
                      (only-in racket/sequence in-syntax)
-                     syntax/parse))
+                     syntax/parse
+                     syntax/parse/define
+                     (for-syntax racket/base
+                                 syntax/parse
+                                 syntax/parse/define)))
+         
+
+(define (default-on-tick state) state)
+(define default-tick-rate 1/28)
+(define (default-on-key state key-event) state)
+(define (default-stop-when state) #false)
+(define default-name "World")
 
 (struct vtable
-  (draw
-   tick
-   key
+  (to-draw
+   window
+   on-tick
+   tick-rate
+   on-key
    ; release
    ; pad
    ; mouse
-   stop
-   ; last-picture
+   stop-when
+   last-picture
    name))
 
-(struct reactor
-  (state
-   vtable))
+(struct reactor-struct
+  (state vtable)
+  #:methods gen:custom-write
+  [(define (write-proc r port mode)
+     (display "#<reactor " port)
+     (write/mode (reactor-state r) port mode)
+     (fprintf port " ~a>" ((vtable-to-draw (reactor-vtable r))
+                           (reactor-state r))))])
+
+(define (write/mode v port mode)
+  (cond
+    [(number? mode)  (print v port mode)]
+    [mode            (write v port)]
+    [else            (display v port)]))
+
+(define (reactor? r)
+  (reactor-struct? r))
+
+(define (reactor-state r)
+  (reactor-struct-state r))
+
+(define reactor-vtable
+  reactor-struct-vtable)
 
 (struct time-step ())
 (struct key-event (key))
@@ -35,87 +68,113 @@
 (define the-time-step (time-step))
 
 (begin-for-syntax
-  (define-syntax-class reactor-clause
-    #:attributes (key val)
-    #:description "a reactor clause, such as (to-draw ...) or (on-tick ...)"
-    (pattern [(~and key (~literal to-draw)) draw:expr]
-             #:attr val #'(list draw))
-    (pattern [(~and key (~literal to-draw)) draw:expr width:expr height:expr]
-             #:attr val #'(list draw width height))
-    (pattern [(~and key (~literal on-tick)) tick:expr]
-             #:attr val #'(list tick))
-    (pattern [(~and key (~literal on-tick)) tick:expr rate:expr]
-             #:attr val #'(list tick rate))
-    (pattern [(~and key (~literal on-tick)) tick:expr rate:expr limit:expr]
-             #:attr val #'(list tick rate limit))
-    (pattern [(~and key (~literal on-key)) val:expr])
-    (pattern [(~and key (~literal stop-when)) val:expr])
-    (pattern [(~and key (~literal name)) val:expr]))
+  (define-syntax-class fun
+    (pattern :expr))
+  (define (parse-clause whole main cxts clause)
+    (define (save-fun key val)
+      (define cxt (hash-ref cxts key #f))
+      (when cxt
+        (raise-syntax-error #f
+                            (format "reactor has repeated ~a clause" key)
+                            whole clause (list cxt)))
+      (hash-set! main key val)
+      (hash-set! cxts key clause))
+    (define-simple-macro (save key:id val:expr (~seq xkey:id xval:expr) ...)
+      (begin
+        (save-fun 'key val)
+        (hash-set! main 'xkey xval) ...))
+    (syntax-parse clause
+      [((~literal to-draw) draw:fun)
+       (save to-draw      #'draw)]
+      [((~literal to-draw) draw:fun width:expr height:expr)
+       (save to-draw      #'draw
+             window       #'(cons width height))]
+      [((~literal on-tick) tick:fun)
+       (save on-tick      #'tick)]
+      [((~literal on-tick) tick:fun rate:expr)
+       (save on-tick      #'tick
+             tick-rate    #'rate)]
+      [((~literal on-tick) tick:fun rate:expr limit:expr)
+       (save on-tick      #'tick
+             tick-rate    #'rate
+             tick-limit   #'limit)]
+      [((~literal on-key) key:fun)
+       (save on-key       #'key)]
+      [((~literal stop-when) stop:fun)
+       (save stop-when    #'stop)]
+      [((~literal stop-when) stop:fun last:fun)
+       (save stop-when    #'stop
+             last-picture #'last)]
+      [((~literal name) s:expr)
+       (save name         #'s)])))
 
-  (define-splicing-syntax-class distinct-reactor-clauses
-    #:attributes (assocs)
-    #:description
-    "some distinct reactor clauses, such as (to-draw ...) and (on-tick ...)"
-    (pattern (~seq clause:reactor-clause ...+)
-             #:fail-when
-             (for/and ([key (in-syntax #'(clause.key ...))])
-               (not (eq? 'to-draw (syntax-e key))))
-             "missing to-draw clause"
-             #:fail-when
-             (check-duplicate-identifier
-              (syntax->list #'(clause.key ...)))
-             "duplicate clause"
-             #:attr assocs (make-hasheq
-                            (for/list ([key (in-syntax #'(clause.key ...))]
-                                       [val (in-syntax #'(clause.val ...))])
-                              (cons (syntax-e key) val))))))
-
-(define (default-on-tick state) state)
-(define (default-on-key state key-event) state)
-(define (default-stop-when state) #false)
-
-(define-syntax (make-reactor stx)
+(define-syntax (reactor stx)
   (syntax-parse stx
-    [(_ state:expr clauses:distinct-reactor-clauses)
-     (define assocs (attribute clauses.assocs))
-     #`(reactor state
-                (vtable
-                 #,(hash-ref assocs 'to-draw)
-                 #,(hash-ref assocs 'on-tick   #'(list default-on-tick))
-                 #,(hash-ref assocs 'on-key    #'default-on-key)
-                 #,(hash-ref assocs 'stop-when #'default-stop-when)
-                 #,(hash-ref assocs 'name      #'"World")))]))
-
+    [(_ state:expr clause:expr ...+)
+     (define main (make-hasheq))
+     (define cxts (make-hasheq))
+     (define-simple-macro (get key:id def:expr)
+       (hash-ref main 'key def))
+     (for ([clause (in-syntax #'(clause ...))])
+       (parse-clause stx main cxts clause))
+     (define the-to-draw
+       (get to-draw
+            (λ ()
+              (raise-syntax-error #f
+                                  "reactor requires a to-draw clause"
+                                  stx))))
+     #`(reactor-struct
+        state
+        (vtable #,the-to-draw
+                #,(get window        #'#f)
+                #,(get on-tick       #'default-on-tick)
+                #,(get tick-rate     #'default-tick-rate)
+                #,(get on-key        #'default-on-key)
+                #,(get stop-when     #'default-stop-when)
+                #,(get last-picture  the-to-draw)
+                #,(get name          #'default-name)))]))
 
 (define (react event r)
   (define q (reactor-state r))
   (define v (reactor-vtable r))
   (match event
     [(struct time-step ())
-     (reactor ((car (vtable-tick v)) q) v)]
+     (reactor-struct ((values (vtable-on-tick v)) q) v)]
     [(struct key-event (key))
-     (reactor ((vtable-key v) q key) v)]
+     (reactor-struct ((vtable-on-key v) q key) v)]
     [(struct mouse-event (x y kind))
      (error 'todo!)]))
 
 (define (reactor-stopped? r)
   (define q (reactor-state r))
   (define v (reactor-vtable r))
-  ((vtable-stop v) q))
+  ((vtable-stop-when v) q))
   
 (define (render-reactor r)
   (define q (reactor-state r))
   (define v (reactor-vtable r))
-  ((car (vtable-draw v)) q))
+  ((vtable-to-draw v) q))
+
+(define (dispatch-big-bang q v)
+  (cond
+      [(vtable-window v)
+       =>
+       (λ (window)
+         (big-bang q
+           [on-tick   (vtable-on-tick v)]
+           [to-draw   (vtable-to-draw v) (car window) (cdr window)]
+           [on-key    (vtable-on-key v)]
+           [name      (vtable-name v)]
+           [stop-when (vtable-stop-when v)]))]
+      [else
+       (big-bang q
+         [on-tick   (vtable-on-tick v)]
+         [to-draw   (vtable-to-draw v)]
+         [on-key    (vtable-on-key v)]
+         [name      (vtable-name v)]
+         [stop-when (vtable-stop-when v)])]))
 
 (define (run-reactor r)
-  (define q0 (reactor-state r))
+  (define q (reactor-state r))
   (define v (reactor-vtable r))
-  (define q1
-   (big-bang q0
-     [on-tick   (car (vtable-tick v))]
-     [to-draw   (car (vtable-draw v))]
-     [on-key    (vtable-key v)]
-     [name      (vtable-name v)]
-     [stop-when (vtable-stop v)]))
-  (reactor q1 v))
+  (reactor-struct (dispatch-big-bang q v) v))
